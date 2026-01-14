@@ -10,10 +10,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/loft-sh/devspace/pkg/util/encoding"
-
 	"github.com/loft-sh/devspace/pkg/devspace/config/constants"
 	"github.com/loft-sh/devspace/pkg/devspace/config/versions/latest"
+	"github.com/loft-sh/devspace/pkg/util/encoding"
 	"github.com/loft-sh/devspace/pkg/util/git"
 	"github.com/loft-sh/devspace/pkg/util/log"
 	"github.com/mitchellh/go-homedir"
@@ -146,12 +145,20 @@ func DownloadDependency(ctx context.Context, workingDirectory string, source *la
 
 		// Git pull
 		if !source.DisablePull && source.Revision == "" {
-			err = repo.Pull(ctx)
-			if err != nil {
-				log.Warn(err)
-			}
+			pullErr := repo.Pull(ctx)
+			if pullErr != nil {
+				log.Debugf("Git pull failed: %v", pullErr)
 
-			log.Debugf("Pulled %s", gitPath)
+				// Try to reclone if pull fails
+				log.Infof("Git pull failed with recoverable error, re-cloning dependency: %s", gitPath)
+				if recloneErr := recloneDependency(ctx, localPath, gitCloneOptions, gitPath, log); recloneErr != nil {
+					// Reclone also failed, return both errors
+					return "", errors.Wrapf(recloneErr, "git pull failed (%v) and reclone failed", pullErr)
+				}
+				// Reclone succeeded, continue
+			} else {
+				log.Debugf("Pulled %s", gitPath)
+			}
 		}
 
 		// Resolve local source
@@ -256,4 +263,29 @@ func GetDependencyID(source *latest.SourceConfig) (string, error) {
 
 func isURL(path string) bool {
 	return strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://")
+}
+
+func recloneDependency(ctx context.Context, localPath string, gitCloneOptions git.CloneOptions, gitPath string, log log.Logger) error {
+	if err := os.RemoveAll(localPath); err != nil {
+		log.Warnf("Failed to remove dependency cache: %v", err)
+		return nil
+	}
+
+	repo, err := git.NewGitCLIRepository(ctx, localPath)
+	if err != nil {
+		log.Warnf("Failed to recreate git repository: %v", err)
+		return nil
+	}
+
+	err = repo.Clone(ctx, gitCloneOptions)
+	if err != nil {
+		gitCloneOptions.URL = switchURLType(gitPath)
+		err = repo.Clone(ctx, gitCloneOptions)
+		if err != nil {
+			return errors.Wrap(err, "re-clone repository")
+		}
+	}
+
+	log.Donef("Successfully recovered dependency: %s", gitPath)
+	return nil
 }
